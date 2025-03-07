@@ -9,6 +9,7 @@ import random
 import string
 import asyncio
 import json
+import ctypes
 from multiprocessing import Process
 
 
@@ -571,3 +572,32 @@ def test_delete_keys(server, test_dtype):
     assert conn.check_exist(keys[1])
     assert not conn.check_exist(keys[0])
     assert not conn.check_exist(keys[2])
+
+
+def get_ptr(mv: memoryview):
+    return ctypes.addressof(ctypes.c_char.from_buffer(mv))
+
+
+def test_simple_tcp_read_write(server):
+    config = infinistore.ClientConfig(
+        host_addr="127.0.0.1",
+        service_port=92345,
+        connection_type=infinistore.TYPE_TCP,
+    )
+
+    try:
+        conn = infinistore.InfinityConnection(config)
+        conn.connect()
+        key = generate_random_string(10)
+        size = 256 * 1024
+        src = bytearray(size)
+        for i in range(size):
+            src[i] = i % 200
+        conn.tcp_write_cache_single(key, get_ptr(src), len(src))
+
+        dst = conn.tcp_read_cache_single(key)
+        assert len(dst) == len(src)
+        for i in range(len(src)):
+            assert dst[i] == src[i]
+    finally:
+        conn.close()

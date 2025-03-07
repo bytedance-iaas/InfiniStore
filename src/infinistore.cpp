@@ -48,7 +48,11 @@ std::unordered_map<std::string, boost::intrusive_ptr<PTR>> kv_map;
 typedef enum {
     READ_HEADER,
     READ_BODY,
+    READ_VALUE_THROUGH_TCP,
 } read_state_t;
+
+// the max data could be send in uv_write
+static const size_t MAX_SEND_SIZE = 256 << 10;
 
 struct Client {
     uv_tcp_t *handle_ = NULL;    // uv_stream_t
@@ -56,6 +60,8 @@ struct Client {
     size_t bytes_read_ = 0;      // bytes read so far, for parsing the request
     size_t expected_bytes_ = 0;  // expected size of the body
     header_t header_;
+
+    boost::intrusive_ptr<PTR> current_tcp_task_;
 
     // RDMA recv buffer
     char *recv_buffer_[MAX_RECV_WR] = {};
@@ -93,6 +99,7 @@ struct Client {
     int allocate_rdma(const RemoteMetaRequest *req);
     // send response to client through TCP
     void send_resp(int return_code, void *buf, size_t size);
+    int tcp_payload_request(const TCPPayloadRequest *request);
     int sync_stream();
     void reset_client_read_state();
     int check_key(const std::string &key_to_check);
@@ -170,6 +177,126 @@ Client::~Client() {
         ibv_destroy_comp_channel(comp_channel_);
         comp_channel_ = NULL;
     }
+}
+
+void on_close(uv_handle_t *handle) {
+    client_t *client = (client_t *)handle->data;
+    delete client;
+}
+
+struct BulkWriteCtx {
+    client_t *client;
+    uint32_t *header_buf;
+    boost::intrusive_ptr<PTR> ptr;
+    size_t offset;
+    size_t total_size;
+};
+
+void on_chunk_write(uv_write_t *req, int status) {
+    BulkWriteCtx *ctx = (BulkWriteCtx *)req->data;
+    if (status < 0) {
+        ERROR("Write error {}", uv_strerror(status));
+        uv_close((uv_handle_t *)req->handle, on_close);
+        free(req);
+        delete ctx;
+        return;
+    }
+
+    if (ctx->offset == ctx->total_size) {
+        INFO("write done");
+        ctx->client->reset_client_read_state();
+        free(req);
+        delete ctx;
+        return;
+    }
+    size_t remain = ctx->total_size - ctx->offset;
+    size_t send_size = MIN(remain, MAX_SEND_SIZE);
+    uv_buf_t buf = uv_buf_init((char *)ctx->ptr->ptr + ctx->offset, send_size);
+    ctx->offset += send_size;
+    uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
+    write_req->data = ctx;
+    uv_write(write_req, (uv_stream_t *)ctx->client->handle_, &buf, 1, on_chunk_write);
+    free(req);
+}
+
+void on_head_write(uv_write_t *req, int status) {
+    BulkWriteCtx *ctx = (BulkWriteCtx *)req->data;
+    if (status < 0) {
+        ERROR("Write error {}", uv_strerror(status));
+        free(ctx->header_buf);
+        delete ctx;
+        free(req);
+        uv_close((uv_handle_t *)req->handle, on_close);
+        return;
+    }
+
+    INFO("header write done");
+    size_t remain = ctx->total_size;
+    size_t send_size = MIN(remain, MAX_SEND_SIZE);
+    uv_buf_t buf = uv_buf_init((char *)ctx->ptr->ptr, send_size);
+    ctx->offset += send_size;
+    uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
+    write_req->data = ctx;
+    uv_write(write_req, (uv_stream_t *)ctx->client->handle_, &buf, 1, on_chunk_write);
+    free(req);
+}
+
+int Client::tcp_payload_request(const TCPPayloadRequest *req) {
+    INFO("do tcp_payload_request... {}", op_name(req->op()));
+
+    switch (req->op()) {
+        case OP_TCP_PUT: {
+            int ret = mm->allocate(req->value_length(), 1,
+                                   [&](void *addr, uint32_t lkey, uint32_t rkey, int pool_idx) {
+                                       current_tcp_task_ = boost::intrusive_ptr<PTR>(
+                                           new PTR(addr, req->value_length(), pool_idx, false));
+                                   });
+            if (ret < 0) {
+                ERROR("Failed to allocate memory");
+                return OUT_OF_MEMORY;
+            }
+            INFO("allocated memory: addr: {}, lkey: {}, rkey: {}", current_tcp_task_->ptr,
+                 mm->get_lkey(current_tcp_task_->pool_idx),
+                 mm->get_rkey(current_tcp_task_->pool_idx));
+
+            kv_map[req->key()->str()] = current_tcp_task_;
+            // set state machine
+            state_ = READ_VALUE_THROUGH_TCP;
+            bytes_read_ = 0;
+            expected_bytes_ = req->value_length();
+            break;
+        }
+        case OP_TCP_GET: {
+            auto it = kv_map.find(req->key()->str());
+            if (it == kv_map.end()) {
+                return KEY_NOT_FOUND;
+            }
+            if (!it->second->committed) {
+                return KEY_NOT_FOUND;
+            }
+            auto ptr = it->second;
+
+            uint32_t *header_buf = (uint32_t *)malloc(sizeof(uint32_t) * 2);
+            header_buf[0] = FINISH;
+            header_buf[1] = static_cast<uint32_t>(ptr->size);
+
+            uv_write_t *write_req = (uv_write_t *)malloc(sizeof(uv_write_t));
+
+            // safe PTR to prevent it from being deleted early.
+            write_req->data = new BulkWriteCtx{.client = this,
+                                               .header_buf = header_buf,
+                                               .ptr = ptr,
+                                               .offset = 0,
+                                               .total_size = ptr->size};
+
+            uv_buf_t buf = uv_buf_init((char *)header_buf, sizeof(uint32_t) * 2);
+
+            uv_write(write_req, (uv_stream_t *)handle_, &buf, 1, on_head_write);
+
+            break;
+        }
+    }
+    return 0;
 }
 
 void Client::cq_poll_handle(uv_poll_t *handle, int status, int events) {
@@ -550,11 +677,6 @@ void Client::reset_client_read_state() {
     // keep the tcp_recv_buffer/tcp_send_buffer as it is
 }
 
-void on_close(uv_handle_t *handle) {
-    client_t *client = (client_t *)handle->data;
-    delete client;
-}
-
 void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     buf->base = (char *)malloc(suggested_size);
     buf->len = suggested_size;
@@ -905,7 +1027,6 @@ int Client::delete_keys(const DeleteKeysRequest *request) {
 void handle_request(uv_stream_t *stream, client_t *client) {
     auto start = std::chrono::high_resolution_clock::now();
     int error_code = 0;
-    int op = client->header_.op;
     // if error_code is not 0, close the connection
     switch (client->header_.op) {
         case OP_RDMA_EXCHANGE: {
@@ -930,6 +1051,12 @@ void handle_request(uv_stream_t *stream, client_t *client) {
             INFO("delete keys...");
             const DeleteKeysRequest *request = GetDeleteKeysRequest(client->tcp_recv_buffer_);
             error_code = client->delete_keys(request);
+            break;
+        }
+        case OP_TCP_PAYLOAD: {
+            INFO("TCP GET/PUT data...");
+            const TCPPayloadRequest *request = GetTCPPayloadRequest(client->tcp_recv_buffer_);
+            error_code = client->tcp_payload_request(request);
             break;
         }
         default:
@@ -969,23 +1096,19 @@ void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
                 if (client->bytes_read_ == FIXED_HEADER_SIZE) {
                     DEBUG("HEADER: op: {}, body_size :{}", client->header_.op,
                           (unsigned int)client->header_.body_size);
-                    if (client->header_.op == OP_CHECK_EXIST ||
-                        client->header_.op == OP_GET_MATCH_LAST_IDX ||
-                        client->header_.op == OP_RDMA_EXCHANGE ||
-                        client->header_.op == OP_DELETE_KEYS) {
-                        int ret = verify_header(&client->header_);
-                        if (ret != 0) {
-                            ERROR("Invalid header");
-                            uv_close((uv_handle_t *)stream, on_close);
-                            goto clean_up;
-                        }
-                        // prepare for reading body
-                        client->expected_bytes_ = client->header_.body_size;
-                        client->bytes_read_ = 0;
-                        client->tcp_recv_buffer_ =
-                            (char *)realloc(client->tcp_recv_buffer_, client->expected_bytes_);
-                        client->state_ = READ_BODY;
+
+                    int ret = verify_header(&client->header_);
+                    if (ret != 0) {
+                        ERROR("Invalid header");
+                        uv_close((uv_handle_t *)stream, on_close);
+                        goto clean_up;
                     }
+                    // prepare for reading body
+                    client->expected_bytes_ = client->header_.body_size;
+                    client->bytes_read_ = 0;
+                    client->tcp_recv_buffer_ =
+                        (char *)realloc(client->tcp_recv_buffer_, client->expected_bytes_);
+                    client->state_ = READ_BODY;
                 }
                 break;
             }
@@ -1005,6 +1128,22 @@ void on_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
                     handle_request(stream, client);
                 }
                 break;
+            }
+            case READ_VALUE_THROUGH_TCP: {
+                size_t to_copy = MIN(nread - offset, client->expected_bytes_ - client->bytes_read_);
+                INFO("to_copy: {}, bytes_read: {}, expected_bytes: {}", to_copy,
+                     client->bytes_read_, client->expected_bytes_);
+                memcpy(client->current_tcp_task_->ptr + client->bytes_read_, buf->base + offset,
+                       to_copy);
+                client->bytes_read_ += to_copy;
+                offset += to_copy;
+                if (client->bytes_read_ == client->expected_bytes_) {
+                    INFO("value read done, size {}", client->expected_bytes_);
+                    client->current_tcp_task_->committed = true;
+                    client->current_tcp_task_.reset();
+                    client->send_resp(FINISH, NULL, 0);
+                    client->reset_client_read_state();
+                }
             }
         }
     }

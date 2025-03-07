@@ -8,10 +8,12 @@ import subprocess
 import asyncio
 from functools import singledispatchmethod
 from typing import Optional, Union, List, Tuple
+import numpy as np
 
 
 # connection type: default is RDMA
 TYPE_RDMA = "RDMA"
+TYPE_TCP = "TCP"
 # rdma link type
 LINK_ETHERNET = "Ethernet"
 LINK_IB = "IB"
@@ -66,7 +68,7 @@ class ClientConfig(_infinistore.ClientConfig):
         )
 
     def verify(self):
-        if self.connection_type not in [TYPE_RDMA]:
+        if self.connection_type not in [TYPE_RDMA, TYPE_TCP]:
             raise Exception("Invalid connection type")
         if self.host_addr == "":
             raise Exception("Host address is empty")
@@ -280,7 +282,7 @@ class InfinityConnection:
         self.config = config
 
         # used for async io
-        self.semaphore = asyncio.BoundedSemaphore(32)
+        self.semaphore = asyncio.BoundedSemaphore(128)
         Logger.set_log_level(config.log_level)
 
     async def connect_async(self):
@@ -301,9 +303,10 @@ class InfinityConnection:
         def blocking_connect():
             if self.conn.init_connection(self.config) < 0:
                 raise Exception("Failed to initialize remote connection")
-            if self.conn.setup_rdma(self.config) < 0:
-                raise Exception("Failed to setup RDMA connection")
-            self.rdma_connected = True
+            if self.config.connection_type == TYPE_RDMA:
+                if self.conn.setup_rdma(self.config) < 0:
+                    raise Exception("Failed to setup RDMA connection")
+                self.rdma_connected = True
 
         await loop.run_in_executor(None, blocking_connect)
 
@@ -324,10 +327,11 @@ class InfinityConnection:
         if ret < 0:
             raise Exception("Failed to initialize remote connection")
 
-        ret = self.conn.setup_rdma(self.config)
-        if ret < 0:
-            raise Exception(f"Failed to write to infinistore, ret = {ret}")
-        self.rdma_connected = True
+        if self.config.connection_type == TYPE_RDMA:
+            ret = self.conn.setup_rdma(self.config)
+            if ret < 0:
+                raise Exception(f"Failed to write to infinistore, ret = {ret}")
+            self.rdma_connected = True
 
     async def rdma_write_cache_async(
         self, cache: torch.Tensor, offsets: List[int], page_size, remote_blocks: List
@@ -374,6 +378,45 @@ class InfinityConnection:
             _callback,
         )
         return await future
+
+    def tcp_read_cache_single(self, key: str, **kwargs) -> np.ndarray:
+        """
+        Retrieve a single cached item from the TCP connection.
+
+        Parameters:
+        key (str): The key associated with the cached item.
+        **kwargs: Additional keyword arguments.
+
+        Returns:
+        np.ndarray: The cached item retrieved from the TCP connection.
+        """
+        return self.conn.r_tcp(key)
+
+    def tcp_write_cache_single(self, key: str, ptr: int, size: int, **kwargs):
+        """
+        Writes a single cache entry to the remote memory using TCP.
+
+        Args:
+            key (str): The key of the cache entry to write.
+            ptr (int): The pointer to the memory location where the data should be written.
+            size (int): The size of the data to write.
+            **kwargs: Additional keyword arguments.
+
+        Raises:
+            Exception: If the key is empty.
+            Exception: If the size is 0.
+            Exception: If the pointer is 0.
+            Exception: If the write operation fails.
+        """
+        if key == "":
+            raise Exception("key is empty")
+        if size == 0:
+            raise Exception("size is 0")
+        if ptr == 0:
+            raise Exception("ptr is 0")
+        ret = self.conn.w_tcp(key, ptr, size)
+        if ret < 0:
+            raise Exception(f"Failed to write to infinistore, ret = {ret}")
 
     async def rdma_write_cache_single_async(
         self, key: str, ptr: int, size: int, **kwargs

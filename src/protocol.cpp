@@ -2,7 +2,10 @@
 
 #include <unordered_map>
 
-std::unordered_map<char, std::string> op_map = {{OP_RDMA_EXCHANGE, "RDMA_EXCHANGE"},
+std::unordered_map<char, std::string> op_map = {{OP_TCP_PAYLOAD, "TCP_PAYLOAD"},
+                                                {OP_TCP_PUT, "TCP_PUT"},
+                                                {OP_TCP_GET, "TCP_GET"},
+                                                {OP_RDMA_EXCHANGE, "RDMA_EXCHANGE"},
                                                 {OP_RDMA_READ, "RDMA_READ"},
                                                 {OP_RDMA_WRITE_COMMIT, "RDMA_WRITE_COMMIT"},
                                                 {OP_RDMA_ALLOCATE, "RDMA_ALLOCATE"},

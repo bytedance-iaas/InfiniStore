@@ -50,7 +50,6 @@ PYBIND11_MODULE(_infinistore, m) {
         .def(py::init<>())
         .def("close", &Connection::close_conn, py::call_guard<py::gil_scoped_release>(),
              "close the connection")
-
         .def(
             "r_rdma",
             [](Connection &self, const std::vector<std::tuple<std::string, unsigned long>> &blocks,
@@ -62,7 +61,6 @@ PYBIND11_MODULE(_infinistore, m) {
                 return self.r_rdma(c_blocks, block_size, (void *)ptr);
             },
             py::call_guard<py::gil_scoped_release>(), "Read remote memory")
-
         .def(
             "w_rdma",
             [](Connection &self,
@@ -84,7 +82,6 @@ PYBIND11_MODULE(_infinistore, m) {
                                    remote_blocks_len, (void *)base_ptr);
             },
             "Write remote memory")
-
         .def(
             "r_rdma_async",
             [](Connection &self, const std::vector<std::tuple<std::string, unsigned long>> &blocks,
@@ -97,6 +94,20 @@ PYBIND11_MODULE(_infinistore, m) {
             },
             py::call_guard<py::gil_scoped_release>(), "Read remote memory asynchronously")
 
+        .def(
+            "w_tcp",
+            [](Connection &self, const std::string &key, uintptr_t ptr, size_t size) {
+                return self.w_tcp(key, (void *)ptr, size);
+            },
+            py::call_guard<py::gil_scoped_release>(), "Write remote memory using TCP")
+        .def(
+            "r_tcp",
+            [](Connection &self, const std::string &key) {
+                auto vector_ptr = self.r_tcp(key);
+                py::gil_scoped_acquire acquire;
+                return as_pyarray(std::move(*vector_ptr));
+            },
+            py::call_guard<py::gil_scoped_release>(), "Read remote memory using TCP")
         .def(
             "w_rdma_async",
             [](Connection &self,
@@ -134,7 +145,6 @@ PYBIND11_MODULE(_infinistore, m) {
                 return as_pyarray(std::move(*blocks));
             },
             py::call_guard<py::gil_scoped_release>(), "Allocate remote memory")
-
         .def(
             "allocate_rdma_async",
             [](Connection &self, std::vector<std::string> &keys, int block_size,
@@ -156,6 +166,7 @@ PYBIND11_MODULE(_infinistore, m) {
              "setup rdma connection")
         .def("sync_rdma", &Connection::sync_rdma, py::call_guard<py::gil_scoped_release>(),
              "sync the remote server")
+
         .def("check_exist", &Connection::check_exist, py::call_guard<py::gil_scoped_release>(),
              "check if the key exists in the store")
         .def("get_match_last_index", &Connection::get_match_last_index,
@@ -163,7 +174,6 @@ PYBIND11_MODULE(_infinistore, m) {
              "get the last index of a key list which is in the store")
         .def("delete_keys", &Connection::delete_keys, py::call_guard<py::gil_scoped_release>(),
              "delete a list of keys which are in store")
-
         .def(
             "register_mr",
             [](Connection &self, uintptr_t ptr, size_t ptr_region_size) {
